@@ -1,99 +1,100 @@
-import { promises as fs } from "fs";
+// src/lib/claimStore.ts
+import fs from "fs/promises";
 import path from "path";
-
-// --------------------
-// Types
-// --------------------
+import crypto from "crypto";
+import { kv } from "@vercel/kv";
 
 export type ClaimStatus = "open" | "in_progress" | "closed";
 export type ClaimStage =
   | "intake"
-  | "notification"
+  | "coverage"
   | "survey"
-  | "documentation"
-  | "submission"
+  | "repair"
   | "settlement"
   | "recovery"
   | "closed";
 
-export type ClaimLine = "H&M" | "P&I" | "Cargo" | "FD&D" | "War" | "Other";
-
-export type TaskStatus = "open" | "done";
-export type ReminderStatus = "pending" | "done";
-export type DraftStatus = "draft" | "sent";
-
-export type DraftType = "initial_notice" | "reminder" | "docs_request" | "update" | "settlement";
-
-export interface ClaimReport {
+export type ClaimReport = {
   incident_type: string;
-  date_time: string; // ISO
+  date_time: string;
   location: string;
   vessel: string;
   summary: string;
-  potential_claims: ClaimLine[];
+  potential_claims: string[];
   immediate_actions: string;
   missing_information: string;
   coverage_reasoning?: Record<string, string>;
   documents_checklist?: Record<string, string[]>;
-}
+};
 
-export interface ClaimMeta {
+export type ClaimMeta = {
   status: ClaimStatus;
   stage: ClaimStage;
-  line_primary: ClaimLine;
+  line_primary: string;
   reference_external: string;
   handler: string;
   counterparty: string;
-}
+};
 
-export interface ClaimFinancials {
-  currency: string; // "USD", "SGD" etc.
+export type ClaimFinancials = {
+  currency: string;
   claim_value: number;
   reserve: number;
   paid: number;
   deductible: number;
   recovery_expected: number;
   recovery_received: number;
-}
+};
 
-export interface Task {
+export type Task = {
   id: string;
   title: string;
-  status: TaskStatus;
+  status: "open" | "done";
   createdAt: string;
   dueAt?: string;
-}
+};
 
-export interface Reminder {
+export type Reminder = {
   id: string;
   createdAt: string;
-  status: ReminderStatus;
+  status: "pending" | "done";
   dueAt: string;
   to: string;
   channel?: "email" | "call" | "whatsapp";
   subject: string;
   context: string;
-}
+};
 
-export interface Draft {
+export type Draft = {
   id: string;
+  claimId: string;
   createdAt: string;
-  type: DraftType;
-  status: DraftStatus;
+  type: "reminder" | "notification" | "update" | "demand" | "general";
   to: string;
   subject: string;
   body: string;
+  status?: "draft" | "sent";
   sentAt?: string;
-}
+};
 
-export interface TimelineEvent {
+export type TimelineItem = {
   id: string;
-  type: "created" | "status_changed" | "stage_changed" | "financials_updated" | "task_updated" | "reminder_added" | "draft_created" | "draft_sent";
+  type:
+    | "created"
+    | "status_changed"
+    | "stage_changed"
+    | "task_updated"
+    | "reminder_added"
+    | "reminder_done"
+    | "draft_created"
+    | "draft_sent"
+    | "financials_updated"
+    | "meta_updated";
   message: string;
   createdAt: string;
-}
+};
 
-export interface Claim {
+export type Claim = {
   id: string;
   createdAt: string;
   updatedAt: string;
@@ -104,152 +105,176 @@ export interface Claim {
   tasks: Task[];
   reminders: Reminder[];
   drafts: Draft[];
-  timeline: TimelineEvent[];
-}
-
-type Store = {
-  counter: number;
-  claims: Claim[];
+  timeline: TimelineItem[];
 };
 
-// --------------------
-// Storage helpers
-// --------------------
+type Store = { counter: number; claims: Claim[] };
 
-const DATA_DIR = path.join(process.cwd(), ".data");
-const STORE_PATH = path.join(DATA_DIR, "claims.json");
+const KV_KEY = "mic:claims:store:v1";
 
-async function ensureStore(): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  try {
-    await fs.access(STORE_PATH);
-  } catch {
-    const seed: Store = { counter: 0, claims: [] };
-    await fs.writeFile(STORE_PATH, JSON.stringify(seed, null, 2), "utf8");
-  }
-}
-
-async function readStore(): Promise<Store> {
-  await ensureStore();
-  const raw = await fs.readFile(STORE_PATH, "utf8");
-  const parsed = JSON.parse(raw) as Partial<Store>;
-  return {
-    counter: typeof parsed.counter === "number" ? parsed.counter : 0,
-    claims: Array.isArray(parsed.claims) ? (parsed.claims as Claim[]) : [],
-  };
-}
-
-async function writeStore(store: Store): Promise<void> {
-  await ensureStore();
-  await fs.writeFile(STORE_PATH, JSON.stringify(store, null, 2), "utf8");
-}
-
-function nowIso(): string {
+function nowIso() {
   return new Date().toISOString();
 }
 
-function randId(len = 6): string {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let out = "";
-  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
-  return out;
+function rid(prefix: string) {
+  return `${prefix}${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
 }
 
-function safeNumber(x: unknown): number {
-  const n = typeof x === "number" ? x : Number(x);
-  return Number.isFinite(n) ? n : 0;
+function safeNumber(v: unknown, fallback = 0) {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-// --------------------
-// Public API
-// --------------------
+function isVercelRuntime() {
+  // On Vercel, this is always set. Locally it’s usually undefined.
+  return Boolean(process.env.VERCEL);
+}
+
+async function loadLocalFileStore(): Promise<Store> {
+  const dir = path.join(process.cwd(), ".data");
+  const file = path.join(dir, "claims.json");
+  try {
+    const raw = await fs.readFile(file, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.counter === "number" && Array.isArray(parsed.claims)) {
+      return parsed as Store;
+    }
+  } catch {
+    // ignore
+  }
+  return { counter: 0, claims: [] };
+}
+
+async function saveLocalFileStore(store: Store): Promise<void> {
+  const dir = path.join(process.cwd(), ".data");
+  const file = path.join(dir, "claims.json");
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(file, JSON.stringify(store, null, 2), "utf-8");
+}
+
+async function loadStore(): Promise<Store> {
+  if (isVercelRuntime()) {
+    const v = await kv.get<Store>(KV_KEY);
+    if (v && typeof v.counter === "number" && Array.isArray(v.claims)) return v;
+    return { counter: 0, claims: [] };
+  }
+  return loadLocalFileStore();
+}
+
+async function saveStore(store: Store): Promise<void> {
+  if (isVercelRuntime()) {
+    await kv.set(KV_KEY, store);
+    return;
+  }
+  await saveLocalFileStore(store);
+}
+
+function defaultMeta(partial?: Partial<ClaimMeta>): ClaimMeta {
+  return {
+    status: partial?.status ?? "open",
+    stage: partial?.stage ?? "intake",
+    line_primary: partial?.line_primary ?? "H&M",
+    reference_external: partial?.reference_external ?? "",
+    handler: partial?.handler ?? "",
+    counterparty: partial?.counterparty ?? "",
+  };
+}
+
+function defaultFinancials(partial?: Partial<ClaimFinancials>): ClaimFinancials {
+  return {
+    currency: partial?.currency ?? "USD",
+    claim_value: safeNumber(partial?.claim_value, 0),
+    reserve: safeNumber(partial?.reserve, 0),
+    paid: safeNumber(partial?.paid, 0),
+    deductible: safeNumber(partial?.deductible, 0),
+    recovery_expected: safeNumber(partial?.recovery_expected, 0),
+    recovery_received: safeNumber(partial?.recovery_received, 0),
+  };
+}
+
+function defaultReport(narrative: string, partial?: Partial<ClaimReport>): ClaimReport {
+  return {
+    incident_type: partial?.incident_type ?? "Unknown",
+    date_time: partial?.date_time ?? nowIso(),
+    location: partial?.location ?? "Unknown",
+    vessel: partial?.vessel ?? "Unknown",
+    summary: partial?.summary ?? narrative.slice(0, 240),
+    potential_claims: Array.isArray(partial?.potential_claims) ? partial!.potential_claims! : [],
+    immediate_actions: partial?.immediate_actions ?? "",
+    missing_information: partial?.missing_information ?? "",
+    coverage_reasoning: partial?.coverage_reasoning ?? {},
+    documents_checklist: partial?.documents_checklist ?? {},
+  };
+}
+
+function makeClaimId(counter: number) {
+  // e.g. NC-20260119-0001
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `NC-${y}${m}${day}-${String(counter).padStart(4, "0")}`;
+}
+
+function pushTimeline(claim: Claim, type: TimelineItem["type"], message: string) {
+  claim.timeline = Array.isArray(claim.timeline) ? claim.timeline : [];
+  claim.timeline.unshift({
+    id: `${claim.id}-TL-${crypto.randomBytes(4).toString("hex")}`,
+    type,
+    message,
+    createdAt: nowIso(),
+  });
+}
 
 export async function listClaims(): Promise<Claim[]> {
-  const store = await readStore();
-  // newest first
-  return [...store.claims].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  const store = await loadStore();
+  return store.claims.slice().sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-export async function getClaimById(claimId: string): Promise<Claim | null> {
-  const store = await readStore();
-  const c = store.claims.find((x) => x.id === claimId);
-  return c ?? null;
+export async function getClaimById(id: string): Promise<Claim | null> {
+  const store = await loadStore();
+  return store.claims.find((c) => c.id === id) ?? null;
 }
 
+// The new canonical createClaim signature (object input)
 export async function createClaim(input: {
-  id?: string;
   narrative: string;
   report: ClaimReport;
   tasks?: Task[];
   meta?: Partial<ClaimMeta>;
   financials?: Partial<ClaimFinancials>;
+  id?: string;
 }): Promise<Claim> {
-  const store = await readStore();
-
+  const store = await loadStore();
   const nextCounter = (store.counter || 0) + 1;
   store.counter = nextCounter;
 
-  const today = new Date();
-  const y = today.getUTCFullYear();
-  const m = String(today.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(today.getUTCDate()).padStart(2, "0");
-
-  const id =
-    input.id && input.id.trim().length > 0
-      ? input.id.trim()
-      : `NC-${y}${m}${d}-${String(nextCounter).padStart(4, "0")}`;
-
-  const createdAt = nowIso();
-
-  const defaultMeta: ClaimMeta = {
-    status: "open",
-    stage: "intake",
-    line_primary: (input.report?.potential_claims?.[0] ?? "Other") as ClaimLine,
-    reference_external: "",
-    handler: "",
-    counterparty: "",
-  };
-
-  const defaultFin: ClaimFinancials = {
-    currency: "USD",
-    claim_value: 0,
-    reserve: 0,
-    paid: 0,
-    deductible: 0,
-    recovery_expected: 0,
-    recovery_received: 0,
-  };
+  const id = input.id?.trim() || makeClaimId(nextCounter);
+  const t = nowIso();
 
   const claim: Claim = {
     id,
-    createdAt,
-    updatedAt: createdAt,
+    createdAt: t,
+    updatedAt: t,
     narrative: input.narrative,
-    report: input.report,
-    meta: { ...defaultMeta, ...(input.meta ?? {}) },
-    financials: { ...defaultFin, ...(input.financials ?? {}) },
+    report: defaultReport(input.narrative, input.report),
+    meta: defaultMeta(input.meta),
+    financials: defaultFinancials(input.financials),
     tasks: Array.isArray(input.tasks) ? input.tasks : [],
     reminders: [],
     drafts: [],
-    timeline: [
-      {
-        id: `${id}-TL-${randId(8)}`,
-        type: "created",
-        message: "Claim created.",
-        createdAt,
-      },
-    ],
+    timeline: [],
   };
 
-  store.claims.push(claim);
-  await writeStore(store);
+  pushTimeline(claim, "created", "Claim created.");
+  store.claims.unshift(claim);
+  await saveStore(store);
   return claim;
 }
 
 /**
- * ✅ IMPORTANT:
- * This is a PATCH / MERGE update.
- * It MUST accept partial meta/financials (so undefined is allowed).
+ * Used by /api/claims/update
+ * Merge meta + financials partials safely and persist.
  */
 export async function updateClaimFields(
   claimId: string,
@@ -258,103 +283,58 @@ export async function updateClaimFields(
     financials?: Partial<ClaimFinancials>;
   }
 ): Promise<Claim | null> {
-  const store = await readStore();
+  const store = await loadStore();
   const claim = store.claims.find((c) => c.id === claimId);
   if (!claim) return null;
 
-  const beforeStatus = claim.meta.status;
-  const beforeStage = claim.meta.stage;
+  const beforeStatus = claim.meta?.status;
+  const beforeStage = claim.meta?.stage;
 
   if (patch.meta) {
-    claim.meta = { ...claim.meta, ...patch.meta };
+    claim.meta = defaultMeta({ ...claim.meta, ...patch.meta });
+    pushTimeline(claim, "meta_updated", "Meta updated.");
+    if (beforeStatus !== claim.meta.status) {
+      pushTimeline(claim, "status_changed", `Status: ${beforeStatus} → ${claim.meta.status}`);
+    }
+    if (beforeStage !== claim.meta.stage) {
+      pushTimeline(claim, "stage_changed", `Stage: ${beforeStage} → ${claim.meta.stage}`);
+    }
   }
 
   if (patch.financials) {
-    // enforce numbers where needed (prevents UI weirdness)
-    const f = patch.financials;
-    claim.financials = {
-      ...claim.financials,
-      ...f,
-      claim_value: f.claim_value !== undefined ? safeNumber(f.claim_value) : claim.financials.claim_value,
-      reserve: f.reserve !== undefined ? safeNumber(f.reserve) : claim.financials.reserve,
-      paid: f.paid !== undefined ? safeNumber(f.paid) : claim.financials.paid,
-      deductible: f.deductible !== undefined ? safeNumber(f.deductible) : claim.financials.deductible,
-      recovery_expected:
-        f.recovery_expected !== undefined ? safeNumber(f.recovery_expected) : claim.financials.recovery_expected,
-      recovery_received:
-        f.recovery_received !== undefined ? safeNumber(f.recovery_received) : claim.financials.recovery_received,
-    };
+    claim.financials = defaultFinancials({ ...claim.financials, ...patch.financials });
+    pushTimeline(claim, "financials_updated", "Financials updated (value/reserve/paid/deductible/recoveries).");
   }
 
   claim.updatedAt = nowIso();
-
-  // timeline
-  if (patch.meta?.status && patch.meta.status !== beforeStatus) {
-    claim.timeline.unshift({
-      id: `${claimId}-TL-${randId(8)}`,
-      type: "status_changed",
-      message: `Status: ${beforeStatus} → ${patch.meta.status}`,
-      createdAt: claim.updatedAt,
-    });
-  }
-
-  if (patch.meta?.stage && patch.meta.stage !== beforeStage) {
-    claim.timeline.unshift({
-      id: `${claimId}-TL-${randId(8)}`,
-      type: "stage_changed",
-      message: `Stage: ${beforeStage} → ${patch.meta.stage}`,
-      createdAt: claim.updatedAt,
-    });
-  }
-
-  if (patch.financials) {
-    claim.timeline.unshift({
-      id: `${claimId}-TL-${randId(8)}`,
-      type: "financials_updated",
-      message: "Financials updated (value/reserve/paid/deductible/recoveries).",
-      createdAt: claim.updatedAt,
-    });
-  }
-
-  await writeStore(store);
+  await saveStore(store);
   return claim;
 }
 
-// ---- Tasks ----
-
-export async function updateTaskStatus(claimId: string, taskId: string, status: TaskStatus): Promise<Task | null> {
-  const store = await readStore();
+export async function updateTaskStatus(claimId: string, taskId: string, status: "open" | "done"): Promise<Task | null> {
+  const store = await loadStore();
   const claim = store.claims.find((c) => c.id === claimId);
   if (!claim) return null;
-  const t = claim.tasks.find((x) => x.id === taskId);
-  if (!t) return null;
 
-  t.status = status;
+  const tasks = Array.isArray(claim.tasks) ? claim.tasks : [];
+  const idx = tasks.findIndex((t) => t.id === taskId);
+  if (idx < 0) return null;
+
+  tasks[idx] = { ...tasks[idx], status };
+  claim.tasks = tasks;
   claim.updatedAt = nowIso();
-
-  claim.timeline.unshift({
-    id: `${claimId}-TL-${randId(8)}`,
-    type: "task_updated",
-    message: `Task ${taskId} → ${status}`,
-    createdAt: claim.updatedAt,
-  });
-
-  await writeStore(store);
-  return t;
+  pushTimeline(claim, "task_updated", `Task ${taskId} marked ${status}.`);
+  await saveStore(store);
+  return tasks[idx];
 }
 
-// Backward-compatible export name (some route files import this)
-export const setTaskStatus = updateTaskStatus;
-
-// ---- Reminders ----
-
 export async function addReminder(claimId: string, reminder: Omit<Reminder, "id" | "createdAt" | "status">): Promise<Reminder | null> {
-  const store = await readStore();
+  const store = await loadStore();
   const claim = store.claims.find((c) => c.id === claimId);
   if (!claim) return null;
 
-  const created: Reminder = {
-    id: `${claimId}-R${randId(6)}`,
+  const r: Reminder = {
+    id: `${claimId}-R${crypto.randomBytes(3).toString("hex").toUpperCase()}`,
     createdAt: nowIso(),
     status: "pending",
     dueAt: reminder.dueAt,
@@ -364,84 +344,67 @@ export async function addReminder(claimId: string, reminder: Omit<Reminder, "id"
     context: reminder.context,
   };
 
-  claim.reminders.unshift(created);
+  claim.reminders = Array.isArray(claim.reminders) ? claim.reminders : [];
+  claim.reminders.unshift(r);
   claim.updatedAt = nowIso();
-
-  claim.timeline.unshift({
-    id: `${claimId}-TL-${randId(8)}`,
-    type: "reminder_added",
-    message: `Reminder added: ${created.subject} → ${created.to}`,
-    createdAt: claim.updatedAt,
-  });
-
-  await writeStore(store);
-  return created;
+  pushTimeline(claim, "reminder_added", `Reminder created: ${r.subject}.`);
+  await saveStore(store);
+  return r;
 }
 
 export async function markReminderDone(claimId: string, reminderId: string): Promise<Reminder | null> {
-  const store = await readStore();
+  const store = await loadStore();
   const claim = store.claims.find((c) => c.id === claimId);
   if (!claim) return null;
 
-  const r = claim.reminders.find((x) => x.id === reminderId);
+  const rems = Array.isArray(claim.reminders) ? claim.reminders : [];
+  const r = rems.find((x) => x.id === reminderId);
   if (!r) return null;
 
   r.status = "done";
   claim.updatedAt = nowIso();
-  await writeStore(store);
+  pushTimeline(claim, "reminder_done", `Reminder done: ${r.subject}.`);
+  await saveStore(store);
   return r;
 }
 
-// ---- Drafts ----
-
-export async function addDraft(claimId: string, draft: Omit<Draft, "id" | "createdAt" | "status">): Promise<Draft | null> {
-  const store = await readStore();
+export async function addDraft(claimId: string, draft: Omit<Draft, "id" | "claimId" | "createdAt" | "status" | "sentAt">): Promise<Draft | null> {
+  const store = await loadStore();
   const claim = store.claims.find((c) => c.id === claimId);
   if (!claim) return null;
 
-  const created: Draft = {
-    id: `${claimId}-D${randId(6)}`,
+  const d: Draft = {
+    id: `${claimId}-D${crypto.randomBytes(3).toString("hex").toUpperCase()}`,
+    claimId,
     createdAt: nowIso(),
     status: "draft",
-    type: draft.type,
+    type: draft.type ?? "general",
     to: draft.to,
     subject: draft.subject,
     body: draft.body,
   };
 
-  claim.drafts.unshift(created);
+  claim.drafts = Array.isArray(claim.drafts) ? claim.drafts : [];
+  claim.drafts.unshift(d);
   claim.updatedAt = nowIso();
-
-  claim.timeline.unshift({
-    id: `${claimId}-TL-${randId(8)}`,
-    type: "draft_created",
-    message: `Draft created: ${created.type}`,
-    createdAt: claim.updatedAt,
-  });
-
-  await writeStore(store);
-  return created;
+  pushTimeline(claim, "draft_created", `Draft created: ${d.subject}.`);
+  await saveStore(store);
+  return d;
 }
 
 export async function markDraftSent(claimId: string, draftId: string): Promise<Draft | null> {
-  const store = await readStore();
+  const store = await loadStore();
   const claim = store.claims.find((c) => c.id === claimId);
   if (!claim) return null;
 
-  const d = claim.drafts.find((x) => x.id === draftId);
+  const drafts = Array.isArray(claim.drafts) ? claim.drafts : [];
+  const d = drafts.find((x) => x.id === draftId);
   if (!d) return null;
 
   d.status = "sent";
   d.sentAt = nowIso();
   claim.updatedAt = nowIso();
-
-  claim.timeline.unshift({
-    id: `${claimId}-TL-${randId(8)}`,
-    type: "draft_sent",
-    message: `Draft marked sent: ${draftId}`,
-    createdAt: claim.updatedAt,
-  });
-
-  await writeStore(store);
+  pushTimeline(claim, "draft_sent", `Draft sent: ${d.subject}.`);
+  await saveStore(store);
   return d;
 }
