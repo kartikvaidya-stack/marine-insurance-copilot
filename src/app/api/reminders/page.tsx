@@ -176,7 +176,7 @@ function DraftActions(props: {
   reminderId?: string;
 }) {
   return (
-    // @ts-expect-error Server/Client boundary handled by Next
+    // @ts-ignore Server/Client boundary handled by Next
     <DraftActionsClient {...props} />
   );
 }

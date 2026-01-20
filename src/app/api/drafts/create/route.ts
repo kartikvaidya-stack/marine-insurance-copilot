@@ -1,85 +1,94 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
-import { addDraft, getClaim } from "@/lib/claimStore";
+import { addDraft, getClaimById } from "@/lib/claimStore";
+
+export const runtime = "nodejs";
+
+type Body = {
+  claimId?: string;
+  type?: string; // "reminder" etc
+  to?: string;
+  subject?: string;
+  context?: string; // user notes
+};
 
 export async function POST(req: Request) {
   try {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) return NextResponse.json({ error: "OPENAI_API_KEY missing" }, { status: 500 });
+    const body = (await req.json()) as Body;
 
-    const body = await req.json();
     const claimId = String(body?.claimId || "").trim();
-    const intent = String(body?.intent || "reminder").trim();
-    const to = String(body?.to || "Unknown recipient").trim();
-    const subjectHint = String(body?.subjectHint || "").trim();
-    const context = String(body?.context || "").trim();
+    const type = String(body?.type || "reminder").trim() as any;
 
-    if (!claimId) return NextResponse.json({ error: "Missing claimId" }, { status: 400 });
-
-    const claim = await getClaim(claimId);
-    if (!claim) return NextResponse.json({ error: "Claim not found" }, { status: 404 });
-
-    const openai = new OpenAI({ apiKey });
-
-    const prompt = `
-You are a senior marine insurance claims handler drafting professional emails for Nova Carriers.
-
-Constraints:
-- Clear subject line
-- Short paragraphs
-- Bullet points for documents/info requested
-- Professional tone (P&I / H&M context)
-- Do not invent facts not in claim narrative/report; if needed, request them.
-
-Claim ID: ${claim.id}
-Vessel: ${claim.report.vessel}
-Incident: ${claim.report.incident_type}
-Location: ${claim.report.location}
-Date/Time: ${claim.report.date_time}
-
-Narrative:
-${claim.narrative}
-
-Key missing info:
-${claim.report.missing_information}
-
-Intent: ${intent}
-Recipient: ${to}
-Subject hint: ${subjectHint}
-Additional context: ${context}
-
-Return STRICT JSON:
-{"subject":"...","body":"..."}
-`;
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
-    });
-
-    const raw = completion.choices?.[0]?.message?.content?.trim() || "";
-    const start = raw.indexOf("{");
-    const end = raw.lastIndexOf("}");
-    if (start === -1 || end === -1) {
-      return NextResponse.json({ error: "Draft model output not JSON", raw }, { status: 500 });
+    if (!claimId) {
+      return NextResponse.json({ error: "Missing claimId" }, { status: 400 });
     }
 
-    const jsonLike = raw.slice(start, end + 1).replace(/,\s*([}\]])/g, "$1");
-    const parsed = JSON.parse(jsonLike);
+    const claim = await getClaimById(claimId);
+    if (!claim) {
+      return NextResponse.json({ error: "Claim not found" }, { status: 404 });
+    }
 
-    const saved = await addDraft(claimId, {
-      type: intent === "task_followup" ? "task_followup" : intent === "club_notification" ? "club_notification" : "reminder",
+    // If you already have OPENAI_API_KEY in .env.local, this works.
+    // If not, we'll still create a basic draft without AI.
+    const apiKey = process.env.OPENAI_API_KEY;
+
+    let to = String(body?.to || "P&I Club / Underwriters / Broker").trim();
+    let subject = String(body?.subject || `Claim ${claimId} – Follow Up`).trim();
+    let context = String(body?.context || "").trim();
+
+    let draftBody = `Dear [Recipient],\n\nPlease see our follow up for Claim ${claimId}.\n\n${context ? context + "\n\n" : ""}Best regards,\n\n[Your Name]\nNova Carriers\n`;
+
+    if (apiKey) {
+      try {
+        const client = new OpenAI({ apiKey });
+
+        const prompt = `
+You are a marine insurance claims professional drafting a clear, polite email.
+
+Claim ID: ${claim.id}
+Vessel: ${claim.report?.vessel || ""}
+Incident: ${claim.report?.incident_type || ""}
+Location: ${claim.report?.location || ""}
+Date/Time (ISO): ${claim.report?.date_time || ""}
+Summary: ${claim.report?.summary || ""}
+
+User context / request:
+${context || "(none)"}
+
+Write a concise email draft with:
+- subject line consistent with the subject we pass
+- a short incident reference
+- specific request for missing info/docs if present
+- professional closing
+`;
+
+        const resp = await client.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.3,
+        });
+
+        const ai = resp.choices?.[0]?.message?.content?.trim();
+        if (ai) draftBody = ai;
+      } catch {
+        // fall back to basic draftBody
+      }
+    }
+
+    const created = await addDraft(claimId, {
+      type,
       to,
-      subject: parsed.subject || subjectHint || `Claim ${claimId} – Follow-up`,
-      body: parsed.body || "",
+      subject,
+      body: draftBody,
     });
 
-    return NextResponse.json({ ok: true, draft: saved }, { status: 200 });
-  } catch (err: any) {
-    return NextResponse.json(
-      { error: "Unhandled error creating draft", details: err?.message || String(err) },
-      { status: 500 }
-    );
+    if (!created) {
+      return NextResponse.json({ error: "Failed to create draft" }, { status: 500 });
+    }
+
+    return NextResponse.json({ ok: true, draft: created }, { status: 200 });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return NextResponse.json({ error: "Unhandled error creating draft", details: msg }, { status: 500 });
   }
 }
